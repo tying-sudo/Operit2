@@ -957,27 +957,49 @@ impl OperitApplication {
     /// Advertises exact durable receipts and separately reports unapplied data.
     #[allow(non_snake_case)]
     pub fn syncClock(&self) -> Result<serde_json::Value, String> {
+        let clockStartedAt = operit_host_api::TimeUtils::currentTimeMillis();
+        let mut phaseAt = clockStartedAt;
+        macro_rules! phase {
+            ($name:literal) => {{
+                let now = operit_host_api::TimeUtils::currentTimeMillis();
+                if now - phaseAt >= 100 {
+                    operit_util::AppLogger::AppLogger::i("SyncClockPhase", &format!(
+                        "sync_clock_phase stage={} elapsedMs={}", $name, now - phaseAt));
+                }
+                phaseAt = now;
+            }};
+        }
         let storage = self
             .hostManager
             .runtimeStorageHost
             .clone()
             .ok_or("RuntimeStorageHost is not registered for persistent sync")?;
         let mut errors = PreferenceSpaceMerge::prepare(storage);
-        if let Err(error) = self
-            .runtimeWorkspaceFileSyncStore()
-            .and_then(|store| store.scan())
-        {
-            errors.push(format!("workspace scan: {error}"));
-        }
+        phase!("prepare");
+        // The workspace inventory is maintained by the scheduler's own periodic
+        // scanner, which already wakes a pass when it sees changes. Scanning the
+        // managed roots again here made this cheap change probe walk every file
+        // for every peer call, which dominated switch latency on a phone.
         let store = self.runtimeSyncOperationStore()?;
         errors.extend(store.publishPreferenceOutboxes().map_err(|error| error.to_string())?);
+        phase!("outbox");
         let schema = PreferenceSpaceMerge::schema();
-        let pending_owners = store.pendingOperations().map_err(|e|e.to_string())?;
+        // `syncClock` is the probe every peer pass calls first, so an unbounded
+        // load here decoded every retained oversized initialization snapshot
+        // into memory before any synchronization work began.
+        let pending_owners = store
+            .pendingOperationsWithin(
+                operit_store::SyncOperationStore::SyncOperationStore::MAX_APPLICABLE_OPERATION_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
         let registry = self.transactionRegistry(&schema,&pending_owners)?;
+        phase!("registry");
         let summary = store.synchronizationSummary().map_err(|e|e.to_string())?;
         let (receipt,failures) = registry.receipt()?;
+        phase!("receipt");
         errors.extend(failures);
         let pending = store.applicationOperations().map_err(|e|e.to_string())?;
+        phase!("application_ops");
         let mut states = BTreeMap::<&str, &SyncOperation>::new();
         for operation in pending.iter().filter(|op|op.domain == RUNTIME_FILE_SYNC_DOMAIN) {
             if states.get(operation.entityId.as_str()).is_none_or(|current|
@@ -1006,6 +1028,7 @@ impl OperitApplication {
         result["pendingBlobs"] = serde_json::to_value(blobs.into_values().collect::<Vec<_>>())
             .map_err(|error| error.to_string())?;
         result["errors"] = serde_json::json!(errors);
+        phase!("total");
         Ok(result)
     }
 
@@ -1016,7 +1039,11 @@ impl OperitApplication {
         let errors = journal.publishPreferenceOutboxes().map_err(|e|e.to_string())?;
         if !errors.is_empty() { return Err(errors.join("\n")); }
         let schema = PreferenceSpaceMerge::schema();
-        let pending = journal.pendingOperations().map_err(|e|e.to_string())?;
+        let pending = journal
+            .pendingOperationsWithin(
+                operit_store::SyncOperationStore::SyncOperationStore::MAX_APPLICABLE_OPERATION_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
         let owners = self.transactionRegistry(&schema,&pending)?.reset_transactions()?;
         let files = self.runtimeFileSyncStore()?.resetTransactions()?;
         AppLogger::i("TransactionSync", &format!("sync_transactions.reset owners={owners} files={files}"));
@@ -1048,11 +1075,27 @@ impl OperitApplication {
         Ok(serde_json::json!({"protocolVersion":1,"digest":digest}))
     }
 
+    /// Emits one memory trace for a responder-side synchronization entry so a
+    /// peak on the data-serving peer can be attributed to its caller.
+    pub(super) fn traceSyncMemory(&self, stage: &str, extra: &str) {
+        let rss = std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|status| status.lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|kb| kb.parse::<u64>().ok()))
+            .map_or_else(|| "unknown".to_string(), |kb| (kb / 1024).to_string());
+        operit_util::AppLogger::AppLogger::i(
+            "SyncMemoryTrace",
+            &format!("sync_memory stage={stage} rssMb={rss} {extra}"),
+        );
+    }
+
     /// Exports missing operations while reporting independently unavailable storage engines.
     #[allow(non_snake_case)]
     pub fn syncOperationsSince(
         &self, clock: serde_json::Value, domains: Vec<String>, limit: usize,
     ) -> Result<serde_json::Value,String> {
+        self.traceSyncMemory("operations_since_begin", &format!("limit={limit}"));
         let include_progress = clock.get("includeProgress").and_then(serde_json::Value::as_bool) == Some(true);
         let receipt: SyncReceipt = serde_json::from_value(clock).map_err(|e|e.to_string())?;
         receipt.validate()?;
@@ -1060,7 +1103,11 @@ impl OperitApplication {
         let mut errors = PreferenceSpaceMerge::prepare(storage);
         let journal = self.runtimeSyncOperationStore()?;
         let schema = PreferenceSpaceMerge::schema();
-        let pending = journal.pendingOperations().map_err(|e|e.to_string())?;
+        let pending = journal
+            .pendingOperationsWithin(
+                operit_store::SyncOperationStore::SyncOperationStore::MAX_APPLICABLE_OPERATION_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
         let registry = self.transactionRegistry(&schema,&pending)?;
         let (operations,failures) = registry.export(&receipt,&domains,limit)?;
         errors.extend(failures);
@@ -1074,7 +1121,9 @@ impl OperitApplication {
             vec!["preferences".to_owned(),CHAT_SYNC_DOMAIN.into(),PLUGIN_STORAGE_SYNC_DOMAIN.into(),RUNTIME_FILE_SYNC_DOMAIN.into()]
         } else { domains };
         let files = self.runtimeFileSyncStore()?;
+        self.traceSyncMemory("operations_exported", &format!("count={}", operations.len()));
         let operations = operations.into_iter().map(|op|files.prepareTransactionForTransport(op)).collect::<Result<Vec<_>,_>>()?;
+        self.traceSyncMemory("operations_prepared", &format!("count={}", operations.len()));
         Ok(serde_json::json!({"operations":boundSyncOperationPage(operations,DEFAULT_SYNC_PAGE_BYTES),"remaining":remaining,
             "progressErrors":progress_errors,"errors":errors,"failedDomains":failed_domains}))
     }
@@ -1082,6 +1131,7 @@ impl OperitApplication {
     /// Durably receives originals and materializes independent owners without acknowledging failed application.
     #[allow(non_snake_case)]
     pub fn syncApplyOperations(&self, operations: serde_json::Value) -> Result<serde_json::Value,String> {
+        self.traceSyncMemory("apply_operations_begin", "");
         let operations: Vec<SyncOperation> = serde_json::from_value(operations).map_err(|e|e.to_string())?;
         let files = self.runtimeFileSyncStore()?;
         let mut errors = Vec::new();
@@ -1096,7 +1146,11 @@ impl OperitApplication {
         let journal = self.runtimeSyncOperationStore()?;
         let application = journal.lockApplication().map_err(|e|e.to_string())?;
         journal.receiveOperations(&operations).map_err(|e|e.to_string())?;
-        let pending = journal.pendingOperations().map_err(|e|e.to_string())?;
+        let pending = journal
+            .pendingOperationsWithin(
+                operit_store::SyncOperationStore::SyncOperationStore::MAX_APPLICABLE_OPERATION_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
         let storage = self.hostManager.runtimeStorageHost.clone().ok_or("Runtime storage is unavailable")?;
         if let Err(error) = PreferenceSpaceMerge::prepareLayout(storage.clone()) { errors.push(format!("layout: {error}")); }
         let schema = PreferenceSpaceMerge::schema();

@@ -53,6 +53,29 @@ const WORKSPACE_SCAN_ACTIVE_INTERVAL_MS: u64 = 2_000;
 /// comparison per minute is the worst idle cost.
 const WORKSPACE_SCAN_IDLE_INTERVAL_MS: u64 = 60_000;
 
+/// Reads this process's resident size for synchronization memory tracing only.
+fn syncTracingRssMb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+/// Emits one memory trace line so a peak can be attributed to its stage.
+/// The trace must survive a Host that cannot report resident size, otherwise a
+/// missing reading would silently hide the stage that owns the peak.
+fn traceSyncMemory(stage: &str, extra: &str) {
+    let rss = syncTracingRssMb().map_or_else(|| "unknown".to_string(), |rss| rss.to_string());
+    operit_util::AppLogger::AppLogger::i(
+        "SyncMemoryTrace",
+        &format!("sync_memory stage={stage} rssMb={rss} {extra}"),
+    );
+}
+
 /// Only verified exchange boundaries may become a caller's scheduling baseline.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PeerSyncStatus {
@@ -566,13 +589,22 @@ impl SpacePersistenceSyncService {
                 "synchronization target is not reachable in the current device space: {targetNodeId}"
             ))));
         }
+        traceSyncMemory("peer_enter", &format!("target={targetNodeId}"));
         let storageReplicationAllowed = self.storageReplicationAllowed(targetNodeId)?;
+        traceSyncMemory("storage_allowed", &format!("allowed={storageReplicationAllowed}"));
         if storageReplicationAllowed {
             let protocol: crate::PeerProtocol::PeerProtocol = callRemote(&self.state.nodeRouter,
                 targetNodeId, PeerSyncMethod::Protocol, Value::Null).await?;
             protocol.requireCompatible().map_err(|error| error.to_string())?;
+            traceSyncMemory("protocol_checked", "");
         }
         if storageReplicationAllowed && self.state.nodeRouter.localNodeId().as_str() > targetNodeId {
+            // The lower node id coordinates every pair, so both peers never run
+            // a full pass against each other at the same time. Two concurrent
+            // passes made each side answer the other's clock and page calls
+            // while holding its own exchange, and the measured round trip grew
+            // from tens of milliseconds to many seconds.
+            traceSyncMemory("coordinator_delegate_begin", &format!("target={targetNodeId}"));
             let request = callRemote::<PeerSyncStatus>(&self.state.nodeRouter, targetNodeId,
                 PeerSyncMethod::SyncRequest, json!(SyncRequest { limit, force }));
             tokio::pin!(request);
@@ -639,7 +671,9 @@ impl SpacePersistenceSyncService {
             preferenceNodes.push(self.state.nodeRouter.localNodeId());
         }
         for preferenceNodeId in preferenceNodes {
+            traceSyncMemory("preference_begin", &format!("node={preferenceNodeId}"));
             let preferences = preferenceStore.read(&preferenceScope, &preferenceNodeId)?;
+            traceSyncMemory("preference_read", &format!("node={preferenceNodeId}"));
             let request = serviceCallRequest(&self.state.nodeRouter,
                 crate::NodeSpaceService::NODE_SPACE_CONTROL_TARGET, "exchangePreferences",
                 serde_json::to_value(preferences).map_err(|e| e.to_string())?)?;
@@ -652,10 +686,13 @@ impl SpacePersistenceSyncService {
                 return Err("Device preference response scope changed".into());
             }
             preferenceStore.merge(&preferences)?;
+            traceSyncMemory("preference_merged", &format!("node={preferenceNodeId}"));
         }
         // Admission is not a storage grant. Business replication requires both endpoints to provide storage.
         if !self.storageReplicationAllowed(targetNodeId)? { return Ok(false); }
+        traceSyncMemory("validate_begin", &format!("target={targetNodeId}"));
         self.validateReachableDeviceSpace(targetNodeId).await?;
+        traceSyncMemory("validate_done", &format!("target={targetNodeId}"));
         self.synchronizeDomains(targetNodeId, limit, &SYNC_DOMAINS).await
     }
 
@@ -979,13 +1016,16 @@ impl SpacePersistenceSyncService {
                 localOperations["operations"].clone(),
                 remoteOperations["operations"].clone(),
             )?;
+            traceSyncMemory("page_export", &format!("target={targetNodeId} operations={}", operations.len()));
             // Repeated pages still compare independent owners; missing blobs retain their owners as pending.
             if operations.is_empty() || !pageAddsNewOperations(&mut seenOperationIds, &operations) {
                 if operations.is_empty() && !self.applySynchronizedOperationBatch(targetNodeId, &[], &[], &mut deferredOwners).await? {
                     return Ok(false);
                 }
                 let force = self.state.peerGates.lock().map_err(|e|e.to_string())?.get(targetNodeId).is_some_and(|gate|gate.pendingWork);
+                traceSyncMemory("consistency_begin", &format!("target={targetNodeId}"));
                 let complete = self.synchronizeConsistency(targetNodeId, &localClock, &remoteClock, &deferredOwners, force).await?;
+                traceSyncMemory("consistency_end", &format!("target={targetNodeId} complete={complete}"));
                 if !complete && deferredOwners.is_empty() && pages < MAX_SYNC_PAGES_PER_PASS {
                     pages += 1;
                     continue;
@@ -1054,13 +1094,17 @@ impl SpacePersistenceSyncService {
         sizes: &[usize],
         deferredOwners: &mut BTreeSet<String>,
     ) -> Result<bool, String> {
+        traceSyncMemory("batch_begin", &format!("target={targetNodeId} operations={} bytes={}", operations.len(), sizes.iter().sum::<usize>()));
+        traceSyncMemory("blobs_begin", &format!("target={targetNodeId} operations={}", operations.len()));
         if let Err(error) = self.synchronizeRequiredBlobs(targetNodeId, operations).await {
             self.recordPendingWork(targetNodeId, "blobs", &json!({"errors": [error]}));
         }
+        traceSyncMemory("blobs_end", &format!("target={targetNodeId}"));
         if !self.storageReplicationAllowed(targetNodeId)? { return Ok(false); }
         self.state.progress.records(targetNodeId, 0);
         let chunks = if operations.is_empty() { vec![operations] }
             else { syncPageChunks(operations, sizes, self.state.nodeRouter.maxPeerMessageBytes())? };
+        traceSyncMemory("chunks_ready", &format!("chunks={}", chunks.len()));
         for chunk in chunks {
             let (remote, local) = tokio::join!(
                 callRemote::<Value>(&self.state.nodeRouter, targetNodeId, PeerSyncMethod::SyncApplyOperations, json!({"operations":chunk})),
@@ -1094,6 +1138,7 @@ impl SpacePersistenceSyncService {
         &self,
         peerNodeId: &str,
     ) -> Result<bool, String> {
+        traceSyncMemory("projection_begin", &format!("peer={peerNodeId}"));
         let protocol = projectionProtocol(&self.state.nodeRouter, peerNodeId).await?;
         let mut referenceRevision = None;
         let remote = if protocol.as_ref().is_some_and(|protocol| protocol.snapshotPaging) {
@@ -1102,12 +1147,18 @@ impl SpacePersistenceSyncService {
                 crate::NodeSpaceService::NODE_SPACE_TARGET, "snapshotHeader", Value::Null).await?;
             referenceRevision = Some(header.controlRevision.clone());
             let mut collector = SnapshotCollector::new(header)?;
+            let mut pageCount = 0usize;
             loop {
                 let page = callRemoteService(&self.state.nodeRouter, peerNodeId,
                     crate::NodeSpaceService::NODE_SPACE_TARGET, "snapshotControlPage",
                     serde_json::to_value(collector.request()).map_err(|error| error.to_string())?).await?;
+                pageCount += 1;
+                if pageCount % 8 == 0 {
+                    traceSyncMemory("projection_pages", &format!("pages={pageCount}"));
+                }
                 if collector.push(page)? { break; }
             }
+            traceSyncMemory("projection_pages_done", &format!("pages={pageCount}"));
             let current: SnapshotHeader = callRemoteService(&self.state.nodeRouter, peerNodeId,
                 crate::NodeSpaceService::NODE_SPACE_TARGET, "snapshotHeader", Value::Null).await?;
             collector.finish(current)?
@@ -1120,7 +1171,9 @@ impl SpacePersistenceSyncService {
         let snapshotControlOperations = remote.controlOperations.clone();
         let service = crate::RuntimeRemoteLinkService::RuntimeRemoteLinkService::newWithRouter(
             (*self.state.localRuntime).clone(), self.state.nodeRouter.clone());
+        traceSyncMemory("projection_fetched", &format!("peer={peerNodeId}"));
         service.observePeerSpaceSnapshot(peerNodeId, remote)?;
+        traceSyncMemory("projection_observed", &format!("peer={peerNodeId}"));
         self.applyRemovedMemberEffects(&snapshotControlOperations)?;
         let local = crate::NodeSpaceService::peerSpaceSnapshotForPeer(&service, peerNodeId)?;
         let useReference = protocol.as_ref().is_some_and(|protocol| protocol.projectionReference)
@@ -1221,6 +1274,7 @@ impl SpacePersistenceSyncService {
         let (remote,local) = tokio::join!(biased;
             self.blobPresence(targetNodeId,&references,false), self.blobPresence(targetNodeId,&references,true));
         let mut errors = Vec::new();
+        traceSyncMemory("blob_presence_done", &format!("references={}", references.len()));
         for ((reference,local),remote) in references.iter().zip(local?).zip(remote?) {
             let result = async {
                 self.state.nodeRouter.requirePeerStorageProviders(&self.state.nodeRouter.localNodeId(),targetNodeId)
@@ -1263,6 +1317,9 @@ impl SpacePersistenceSyncService {
             self.state.localRuntime.openPush(request).map_err(|error| error.to_string())?
         };
         let mut offset = 0;
+        if reference.size > 1_000_000 {
+            traceSyncMemory("blob_transfer_begin", &format!("hash={} bytes={}", reference.contentHash, reference.size));
+        }
         let result = async {
             while offset < reference.size {
                 self.state.nodeRouter.requirePeerStorageProviders(&self.state.nodeRouter.localNodeId(), targetNodeId)
