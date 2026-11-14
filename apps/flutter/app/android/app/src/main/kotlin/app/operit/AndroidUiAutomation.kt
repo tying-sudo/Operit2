@@ -1,86 +1,35 @@
 package app.operit
 
 import android.accessibilityservice.AccessibilityService
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
-import android.os.IBinder
 import android.os.SystemClock
-import com.ai.assistance.operit.provider.IAccessibilityProvider
 import java.io.StringReader
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 
-/** Owns only the client connection to the independently installed accessibility APK. */
+/**
+ * Drives the accessibility service that lives inside this application.
+ *
+ * The service used to answer over AIDL from a separate package. It now ships in
+ * this APK, so the same operations run against the local service instance
+ * without a binder hop or a second installation.
+ */
 class AndroidUiAutomation(private val context: Context) {
     private val lock = Any()
-    private val operationLock = Any()
-    private var connection: ProviderConnection? = null
-    private var released = false
 
-    /** Keeps late callbacks attached to their own binding rather than a newer client. */
-    private class ProviderConnection : ServiceConnection {
-        val ready = CountDownLatch(1)
-        @Volatile var service: IAccessibilityProvider? = null
+    /** Returns the connected service, waiting briefly for Android to bind it. */
+    private fun requireService(): OperitAccessibilityService =
+        OperitAccessibilityService.await(context)
+            ?: error("Enable the Operit accessibility service in Android settings")
 
-        /** Publishes the binder returned by this external provider connection. */
-        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
-            service = IAccessibilityProvider.Stub.asInterface(binder)
-            ready.countDown()
+    /** Dispatches UI operations against the local accessibility service. */
+    fun execute(request: JSONObject): JSONObject = synchronized(lock) {
+        val service = requireService()
+        check(service.isAccessibilityServiceEnabled()) {
+            "Enable the Operit accessibility service in Android settings"
         }
-
-        /** Invalidates a disconnected provider. */
-        override fun onServiceDisconnected(name: ComponentName) { service = null }
-
-        /** Completes a rejected bind immediately. */
-        override fun onNullBinding(name: ComponentName) { ready.countDown() }
-
-        /** Invalidates a binding whose provider was replaced or stopped. */
-        override fun onBindingDied(name: ComponentName) { service = null; ready.countDown() }
-    }
-
-    /** Binds the exact legacy service and waits only on the runtime worker. */
-    private fun requireProvider(): IAccessibilityProvider {
-        val binding = synchronized(lock) {
-            check(!released) { "UI automation owner has been released" }
-            connection?.service?.let { if (it.asBinder().isBinderAlive) return it }
-            val pending = ProviderConnection()
-            connection?.let { context.unbindService(it) }
-            connection = null
-            val intent = Intent("com.ai.assistance.operit.provider.IAccessibilityProvider")
-                .setComponent(ComponentName("com.ai.assistance.operit.provider", "com.ai.assistance.operit.provider.RemoteBinderService"))
-            check(context.bindService(intent, pending, Context.BIND_AUTO_CREATE)) {
-                "Install the separate Operit accessibility provider APK before using UI automation"
-            }
-            connection = pending
-            pending
-        }
-        try {
-            check(binding.ready.await(5, TimeUnit.SECONDS)) { "Accessibility provider binding timed out" }
-            return synchronized(lock) {
-                check(!released && connection === binding) { "UI automation owner has been released" }
-                binding.service ?: error("Accessibility provider rejected the connection")
-            }
-        } catch (error: Exception) {
-            synchronized(lock) {
-                if (connection === binding) {
-                    context.unbindService(binding)
-                    connection = null
-                }
-            }
-            throw error
-        }
-    }
-
-    /** Dispatches UI operations exclusively through the legacy AIDL interface. */
-    fun execute(request: JSONObject): JSONObject = synchronized(operationLock) {
-        val service = requireProvider()
-        check(service.isAccessibilityServiceEnabled) { "Enable the separate Operit provider in Android accessibility settings" }
         val operation = request.getString("operation")
         val params = request.getJSONObject("parameters")
         if (operation == "get_page_info") return@synchronized readPage(service)
@@ -89,7 +38,7 @@ class AndroidUiAutomation(private val context: Context) {
             "long_press" -> service.performLongPress(params.getInt("x"), params.getInt("y"))
             "swipe" -> service.performSwipe(params.getInt("start_x"), params.getInt("start_y"), params.getInt("end_x"), params.getInt("end_y"), params.getLong("duration"))
             "set_input_text" -> {
-                val nodeId = if (params.has("resource_id")) findBounds(service.uiHierarchy, params.getString("resource_id")) else service.findFocusedNodeId()
+                val nodeId = if (params.has("resource_id")) findBounds(service.uiHierarchy(), params.getString("resource_id")) else service.findFocusedNodeId()
                 check(!nodeId.isNullOrEmpty()) { "No accessible input element is focused" }
                 service.setTextOnNode(nodeId, params.getString("text"))
             }
@@ -100,14 +49,13 @@ class AndroidUiAutomation(private val context: Context) {
                     "RECENTS" -> AccessibilityService.GLOBAL_ACTION_RECENTS
                     "NOTIFICATIONS" -> AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
                     "QUICK_SETTINGS" -> AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS
-                    else -> error("The legacy accessibility APK supports BACK, HOME, RECENTS, NOTIFICATIONS and QUICK_SETTINGS global keys")
+                    else -> error("The accessibility service supports BACK, HOME, RECENTS, NOTIFICATIONS and QUICK_SETTINGS global keys")
                 }
-                service.performGlobalAction(action)
+                service.runGlobalAction(action)
             }
             else -> error("Unknown UI operation: $operation")
         }
-        check(success) { "Accessibility provider rejected $operation" }
-        // The legacy binder acknowledges dispatch before the gesture finishes.
+        check(success) { "Accessibility service rejected $operation" }
         val gestureDuration = when (operation) {
             "tap" -> 50L
             "long_press" -> 600L
@@ -118,7 +66,7 @@ class AndroidUiAutomation(private val context: Context) {
         JSONObject()
     }
 
-    /** Translates a resource ID to the bounds token required by the legacy APK. */
+    /** Translates a resource ID to the bounds token required by the service. */
     private fun findBounds(xml: String, resourceId: String): String {
         val parser = XmlPullParserFactory.newInstance().newPullParser()
         parser.setInput(StringReader(xml))
@@ -134,9 +82,9 @@ class AndroidUiAutomation(private val context: Context) {
     }
 
     /** Parses one XML snapshot into the common node format with traversal limits. */
-    private fun readPage(service: IAccessibilityProvider): JSONObject {
-        val xml = service.uiHierarchy
-        check(!xml.isNullOrBlank()) { "Accessibility provider returned no hierarchy" }
+    private fun readPage(service: OperitAccessibilityService): JSONObject {
+        val xml = service.uiHierarchy()
+        check(xml.isNotBlank()) { "Accessibility service returned no hierarchy" }
         val parser = XmlPullParserFactory.newInstance().newPullParser()
         parser.setInput(StringReader(xml))
         val roots = JSONArray()
@@ -173,18 +121,10 @@ class AndroidUiAutomation(private val context: Context) {
         val root = JSONObject().put("className", "surface").put("text", JSONObject.NULL)
             .put("contentDesc", JSONObject.NULL).put("resourceId", JSONObject.NULL).put("bounds", JSONObject.NULL)
             .put("isClickable", false).put("children", roots)
-        return JSONObject().put("packageName", packageName).put("activityName", service.currentActivityName)
+        return JSONObject().put("packageName", packageName).put("activityName", service.currentActivityName())
             .put("uiElements", root).put("scope", "desktop").put("truncated", truncated)
     }
 
-    /** Releases the client binding when the application owner shuts down. */
-    fun release() = synchronized(lock) {
-        released = true
-        connection?.let {
-            context.unbindService(it)
-            it.service = null
-            it.ready.countDown()
-        }
-        connection = null
-    }
+    /** Keeps the historical owner contract; the service lifecycle drives the state. */
+    fun release() = Unit
 }

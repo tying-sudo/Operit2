@@ -216,6 +216,9 @@ fn parse_index(value: &Value) -> Result<usize, String> {
 /// Normalizes the documented click overloads into one exact selector object.
 fn click_criteria(parameters: &Map<String, Value>) -> Result<Map<String, Value>, String> {
     let mut criteria = parameters.clone();
+    // The host decorates every tool call with its own environment owner; it is
+    // transport metadata, not a selector, so it must not reach the validator.
+    criteria.retain(|key, _| !key.starts_with("__operit_"));
     if let Some(param1) = criteria.remove("param1") {
         let first = text(&param1);
         let second = criteria.remove("param2");

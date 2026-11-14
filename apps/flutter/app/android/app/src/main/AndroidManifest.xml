@@ -79,6 +79,18 @@
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <service android:name=".PluginSdkService" android:exported="true" />
         <service
+            android:name=".OperitAccessibilityService"
+            android:label="@string/operit_accessibility_service_label"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/operit_accessibility_config" />
+        </service>
+        <service
             android:name=".OperitNotificationListener"
             android:label="Operit notification access"
             android:exported="true"

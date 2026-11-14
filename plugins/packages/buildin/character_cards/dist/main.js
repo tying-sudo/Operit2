@@ -4540,6 +4540,14 @@ var RepositorySession = class extends DatabaseMemoryRepository {
       if (!(yield this.hasMemoryOwner(ownerKey))) return { ownerKey, content: "" };
       const path = yield this.readUserPath(ownerKey), document2 = this.documents.get(ownerKey);
       if (document2 !== void 0) return { ownerKey, content: document2.content };
+      const file = yield Tools.Files.exists(path);
+      if (!file.exists) {
+        const created = yield Tools.Files.mkdir(path.slice(0, path.lastIndexOf("/")), true);
+        if (!created.successful) throw new Error(created.details);
+        const { operation } = yield Tools.Files.write(path, "", false);
+        if (!operation.successful) throw new Error(operation.details);
+        return { ownerKey, content: "" };
+      }
       const result2 = yield Tools.Files.read(path);
       assertString(result2.content, "USER.md content");
       return { ownerKey, content: result2.content };
@@ -5069,9 +5077,16 @@ var DatabaseCharacterRepository = class _DatabaseCharacterRepository {
   readUser(ownerKey) {
     return this.readOwnerMetadata(ownerKey, (row, exists) => __async(this, null, function* () {
       if (!exists) return { ownerKey, content: "" };
-      const document2 = yield Tools.Files.read(
-        this.ownerDocumentPath(ownerKey, row)
-      );
+      const path = this.ownerDocumentPath(ownerKey, row);
+      const file = yield Tools.Files.exists(path);
+      if (!file.exists) {
+        const created = yield Tools.Files.mkdir(path.slice(0, path.lastIndexOf("/")), true);
+        if (!created.successful) throw new Error(created.details);
+        const { operation } = yield Tools.Files.write(path, "", false);
+        if (!operation.successful) throw new Error(operation.details);
+        return { ownerKey, content: "" };
+      }
+      const document2 = yield Tools.Files.read(path);
       assertString(document2.content, "USER.md content");
       return { ownerKey, content: document2.content };
     }));

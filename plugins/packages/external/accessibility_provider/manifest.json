@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.accessibility_provider",
+  "version": "1.0.0",
+  "api_version": "2.0.0",
+  "main": "dist/main.js",
+  "display_name": {
+    "zh": "界面自动化服务",
+    "en": "UI Automation Provider"
+  },
+  "description": {
+    "zh": "检查内置的无障碍服务，读取当前界面快照，验证界面自动化链路。",
+    "en": "Checks the built-in accessibility service and verifies the automation path."
+  },
+  "logo": "package_logo",
+  "enabled_by_default": false,
+  "subpackages": [
+    {
+      "id": "accessibility_provider",
+      "entry": "dist/packages/accessibility_provider.js"
+    }
+  ],
+  "resources": [
+    {
+      "key": "package_logo",
+      "path": "resources/logo.svg",
+      "mime": "image/svg+xml"
+    }
+  ],
+  "author": [
+    "Operit"
+  ],
+  "installation_scope": "space"
+}

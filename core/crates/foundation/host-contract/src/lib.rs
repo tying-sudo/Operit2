@@ -912,6 +912,16 @@ fn androidOnboardingRequirements() -> Vec<HostOnboardingRequirement> {
             status: HostRequirementStatus::Missing,
             action: HostRequirementAction::HostManaged,
         },
+        HostOnboardingRequirement {
+            id: "android.uiAutomation".to_string(),
+            title: "UI 自动化".to_string(),
+            description: "可选。开启无障碍服务后 Operit 可以读取屏幕内容并执行点击、滑动和文本输入。"
+                .to_string(),
+            capabilityIds: vec!["ui.automation".to_string()],
+            isRequired: false,
+            status: HostRequirementStatus::Missing,
+            action: HostRequirementAction::OpenSystemSettings,
+        },
     ]
 }
 

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Declares the capabilities the built-in service needs.
+
+  The service inspects the active window and injects gestures so the AI
+  assistant can read and drive any application on the device. Android grants
+  these only after the user enables the service in the system settings, and the
+  user can revoke them there at any time.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/operit_accessibility_service_description"
+    android:notificationTimeout="100" />

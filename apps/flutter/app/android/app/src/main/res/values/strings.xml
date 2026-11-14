@@ -6,4 +6,6 @@
     <string name="ocr_cannot_read_image">无法读取图像文件: %1$s</string>
     <string name="ocr_cannot_decode_bitmap_from_uri">无法从URI解码Bitmap</string>
     <string name="ocr_cannot_open_uri_stream">无法打开URI的输入流</string>
+    <string name="operit_accessibility_service_label">Operit 界面自动化</string>
+    <string name="operit_accessibility_service_description">允许 AI 助手读取屏幕内容并执行点击、滑动和文本输入。</string>
 </resources>

@@ -334,6 +334,10 @@ class AndroidPlatformChannel(
                 "android.root",
                 activity.isExternalRuntime || AndroidPrivilegeAuthorization.isRootAuthorized(activity),
             ),
+            "android.uiAutomation" to requirement(
+                "android.uiAutomation",
+                isUiAutomationGranted(),
+            ),
         )
     }
 
@@ -367,10 +371,40 @@ class AndroidPlatformChannel(
             }
             "android.shizuku" -> requestShizukuAuthorization(result)
             "android.root" -> requestRootAuthorization(call, result)
+            "android.uiAutomation" -> {
+                openUiAutomationSettings()
+                result.success(null)
+            }
             else -> {
                 result.error("INVALID_ONBOARDING_REQUIREMENT", "Invalid onboarding requirement", null)
                 return
             }
+        }
+    }
+
+    /** Reports whether the built-in accessibility service is switched on. */
+    private fun isUiAutomationGranted(): Boolean {
+        val enabled =
+            Settings.Secure.getString(
+                activity.contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            ) ?: return false
+        return enabled
+            .split(':')
+            .any { it.equals(UI_AUTOMATION_COMPONENT, ignoreCase = true) }
+    }
+
+    /** Opens the system switch list that hosts the built-in accessibility service. */
+    private fun openUiAutomationSettings() {
+        val intent =
+            Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            activity.startActivity(intent)
+        } catch (_: Throwable) {
+            activity.startActivity(
+                Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
         }
     }
 
@@ -685,6 +719,9 @@ class AndroidPlatformChannel(
     }
 
     private companion object {
+        /** Component the system stores once the built-in service is switched on. */
+        private const val UI_AUTOMATION_COMPONENT =
+            "app.operit/app.operit.OperitAccessibilityService"
         private val MODULE_GRANTED_REQUIREMENTS = setOf(
             "android.fileManagement", "android.root", "android.shizuku", "android.batteryOptimization",
         )

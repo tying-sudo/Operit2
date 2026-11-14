@@ -332,9 +332,18 @@ export class DatabaseCharacterRepository implements CharacterRepositoryOwner {
   readUser(ownerKey: string): Promise<UserDocument> {
     return this.readOwnerMetadata(ownerKey, async (row, exists) => {
       if (!exists) return { ownerKey, content: "" };
-      const document = await Tools.Files.read(
-        this.ownerDocumentPath(ownerKey, row),
-      );
+      const path = this.ownerDocumentPath(ownerKey, row);
+      const file = await Tools.Files.exists(path);
+      if (!file.exists) {
+        // A synced owner can arrive before its document is published on this
+        // device; seed the real file so every later read and write has a path.
+        const created = await Tools.Files.mkdir(path.slice(0, path.lastIndexOf("/")), true);
+        if (!created.successful) throw new Error(created.details);
+        const { operation } = await Tools.Files.write(path, "", false);
+        if (!operation.successful) throw new Error(operation.details);
+        return { ownerKey, content: "" };
+      }
+      const document = await Tools.Files.read(path);
       assertString(document.content, "USER.md content");
       return { ownerKey, content: document.content };
     });

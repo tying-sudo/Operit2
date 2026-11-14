@@ -245,6 +245,16 @@ export class RepositorySession extends DatabaseMemoryRepository implements Chara
     if (!(await this.hasMemoryOwner(ownerKey))) return { ownerKey, content: "" };
     const path = await this.readUserPath(ownerKey), document = this.documents.get(ownerKey);
     if (document !== undefined) return { ownerKey, content: document.content };
+    const file = await Tools.Files.exists(path);
+    if (!file.exists) {
+      // A synced owner can arrive before its document is published on this
+      // device; seed the real file so every later read and write has a path.
+      const created = await Tools.Files.mkdir(path.slice(0, path.lastIndexOf("/")), true);
+      if (!created.successful) throw new Error(created.details);
+      const { operation } = await Tools.Files.write(path, "", false);
+      if (!operation.successful) throw new Error(operation.details);
+      return { ownerKey, content: "" };
+    }
     const result = await Tools.Files.read(path); assertString(result.content, "USER.md content");
     return { ownerKey, content: result.content };
   }
